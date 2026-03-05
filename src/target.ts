@@ -2,39 +2,43 @@
  * GitHub Actions Export Target
  *
  * Generates .github/workflows/<name>.yml from a Flow Weaver CI/CD workflow.
- * No FW runtime dependency — outputs native GitHub Actions YAML.
- *
- * Mapping:
- * - FW Node → GitHub Actions step (uses: or run:)
- * - FW [job: "name"] → GitHub Actions job
- * - FW @path → job `needs:` dependencies
- * - FW @secret → ${{ secrets.NAME }}
- * - FW @cache → actions/cache@v4
- * - FW @artifact → actions/upload-artifact@v4 / actions/download-artifact@v4
- * - FW @trigger → `on:` event configuration
+ * Each job runs the compiled workflow code via `node dist/<name>.cicd.js --job=<id>`,
+ * with native GitHub Actions handling orchestration (triggers, dependencies,
+ * runners, secrets, caches, artifacts).
  */
 
 import { stringify as yamlStringify } from 'yaml';
 import type { TWorkflowAST } from '@synergenius/flow-weaver/ast';
-import { isCICDWorkflow } from '@synergenius/flow-weaver/deployment';
 import {
-  BaseCICDTarget,
+  isCICDWorkflow,
+  buildJobGraph,
+  resolveJobSecrets,
+  injectArtifactSteps,
+  generateSecretsDoc,
+  NATIVE_CI_STEPS,
   type CICDJob,
-  type CICDStep,
-} from '@synergenius/flow-weaver/deployment';
+} from '@synergenius/flowweaver-pack-cicd';
 import type {
   ExportOptions,
   ExportArtifacts,
   DeployInstructions,
+  MultiWorkflowArtifacts,
+  CompiledWorkflow,
+  NodeTypeArtifacts,
+  NodeTypeInfo,
+  NodeTypeExportOptions,
+  BundleArtifacts,
+  BundleWorkflow,
+  BundleNodeType,
 } from '@synergenius/flow-weaver/deployment';
+import { BaseExportTarget } from '@synergenius/flow-weaver/deployment';
 import { parseWorkflow } from '@synergenius/flow-weaver/api';
 import * as path from 'path';
 
-export class GitHubActionsTarget extends BaseCICDTarget {
+export class GitHubActionsTarget extends BaseExportTarget {
   readonly name = 'github-actions';
   readonly description = 'GitHub Actions workflow YAML (.github/workflows/)';
 
-  /** Accumulated warnings for the current export run */
   private _warnings: string[] = [];
 
   readonly deploySchema = {
@@ -52,7 +56,6 @@ export class GitHubActionsTarget extends BaseCICDTarget {
     const filePath = path.resolve(options.sourceFile);
     const outputDir = path.resolve(options.outputDir);
 
-    // Parse the workflow file to get AST
     const parseResult = await parseWorkflow(filePath, { nodeTypesOnly: false });
     if (parseResult.errors.length > 0) {
       throw new Error(`Parse errors: ${parseResult.errors.join('; ')}`);
@@ -70,30 +73,20 @@ export class GitHubActionsTarget extends BaseCICDTarget {
     const files = [];
 
     for (const ast of targetWorkflows) {
-      // Build job graph
-      const jobs = this.buildJobGraph(ast);
+      const jobs = buildJobGraph(ast);
+      resolveJobSecrets(jobs, ast, (name) => `\${{ secrets.${name} }}`);
 
-      // Resolve secrets
-      this.resolveJobSecrets(jobs, ast, (name) => `\${{ secrets.${name} }}`);
-
-      // Inject artifacts
       const artifacts = ast.options?.cicd?.artifacts || [];
-      this.injectArtifactSteps(jobs, artifacts);
-
-      // Apply cache, services, matrix from workflow options
+      injectArtifactSteps(jobs, artifacts);
       this.applyWorkflowOptions(jobs, ast);
 
-      // Generate YAML
       const yamlContent = this.renderWorkflowYAML(ast, jobs);
-
-      // Output path: .github/workflows/<name>.yml
       const yamlFileName = `.github/workflows/${ast.functionName}.yml`;
       files.push(this.createFile(outputDir, yamlFileName, yamlContent, 'config'));
 
-      // Generate secrets doc if secrets exist
       const secrets = ast.options?.cicd?.secrets || [];
       if (secrets.length > 0) {
-        const secretsDoc = this.generateSecretsDoc(secrets, 'github-actions');
+        const secretsDoc = generateSecretsDoc(secrets, 'github-actions');
         files.push(this.createFile(outputDir, 'SECRETS_SETUP.md', secretsDoc, 'other'));
       }
     }
@@ -107,6 +100,28 @@ export class GitHubActionsTarget extends BaseCICDTarget {
     };
   }
 
+  async generateMultiWorkflow(
+    _workflows: CompiledWorkflow[],
+    _options: ExportOptions,
+  ): Promise<MultiWorkflowArtifacts> {
+    throw new Error('CI/CD targets use generate() with AST, not generateMultiWorkflow()');
+  }
+
+  async generateNodeTypeService(
+    _nodeTypes: NodeTypeInfo[],
+    _options: NodeTypeExportOptions,
+  ): Promise<NodeTypeArtifacts> {
+    throw new Error('CI/CD targets do not export node types as services');
+  }
+
+  async generateBundle(
+    _workflows: BundleWorkflow[],
+    _nodeTypes: BundleNodeType[],
+    _options: ExportOptions,
+  ): Promise<BundleArtifacts> {
+    throw new Error('CI/CD targets use generate() with AST, not generateBundle()');
+  }
+
   getDeployInstructions(_artifacts: ExportArtifacts): DeployInstructions {
     return {
       title: 'Deploy GitHub Actions Workflow',
@@ -116,6 +131,7 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       ],
       steps: [
         'Copy the .github/workflows/ directory to your repository root',
+        'Build your workflow: npx flow-weaver compile --target cicd <workflow>.ts',
         'Configure required secrets in GitHub (Settings > Secrets > Actions)',
         'Push to trigger the workflow',
       ],
@@ -137,32 +153,25 @@ export class GitHubActionsTarget extends BaseCICDTarget {
   private renderWorkflowYAML(ast: TWorkflowAST, jobs: CICDJob[]): string {
     const doc: Record<string, unknown> = {};
 
-    // name
     doc.name = ast.name;
-
-    // on: triggers
     doc.on = this.renderTriggers(ast.options?.cicd?.triggers || []);
 
-    // env (workflow-level, from @variables)
     if (ast.options?.cicd?.variables && Object.keys(ast.options.cicd.variables).length > 0) {
       doc.env = { ...ast.options.cicd.variables };
     }
 
-    // Warn about @includes (GitLab CI only)
     if (ast.options?.cicd?.includes && ast.options.cicd.includes.length > 0) {
       this._warnings.push(
         `@includes: GitHub Actions has no equivalent to GitLab CI includes. Use reusable workflows (workflow_call) or composite actions instead.`
       );
     }
 
-    // Warn about @before_script at workflow level (no GH Actions equivalent)
     if (ast.options?.cicd?.beforeScript && ast.options.cicd.beforeScript.length > 0) {
       this._warnings.push(
         `Workflow-level @before_script: GitHub Actions has no global before_script. It has been applied per-job instead.`
       );
     }
 
-    // concurrency
     if (ast.options?.cicd?.concurrency) {
       doc.concurrency = {
         group: ast.options.cicd.concurrency.group,
@@ -170,7 +179,6 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       };
     }
 
-    // jobs
     const jobsObj: Record<string, unknown> = {};
     for (const job of jobs) {
       jobsObj[job.id] = this.renderJob(job, ast);
@@ -186,7 +194,6 @@ export class GitHubActionsTarget extends BaseCICDTarget {
 
   private renderTriggers(triggers: Array<{ type: string; branches?: string[]; paths?: string[]; pathsIgnore?: string[]; types?: string[]; cron?: string; pattern?: string; inputs?: Record<string, { description?: string; required?: boolean; default?: string; type?: string }> }>): Record<string, unknown> {
     if (triggers.length === 0) {
-      // Default: manual dispatch
       return { workflow_dispatch: {} };
     }
 
@@ -223,7 +230,6 @@ export class GitHubActionsTarget extends BaseCICDTarget {
             : {};
           break;
         case 'tag': {
-          // Tags are a filter on push
           if (!on.push) on.push = {};
           (on.push as Record<string, unknown>).tags = trigger.pattern
             ? [trigger.pattern]
@@ -239,52 +245,43 @@ export class GitHubActionsTarget extends BaseCICDTarget {
   private renderJob(job: CICDJob, ast: TWorkflowAST): Record<string, unknown> {
     const jobObj: Record<string, unknown> = {};
 
-    // runs-on (tags override: self-hosted + tag labels)
     if (job.tags && job.tags.length > 0) {
       jobObj['runs-on'] = ['self-hosted', ...job.tags];
     } else {
       jobObj['runs-on'] = job.runner || 'ubuntu-latest';
     }
 
-    // needs
     if (job.needs.length > 0) {
       jobObj.needs = job.needs;
     }
 
-    // continue-on-error (from @job allow_failure)
     if (job.allowFailure) {
       jobObj['continue-on-error'] = true;
     }
 
-    // timeout-minutes (from @job timeout, parse "30m" → 30, "1h" → 60)
     if (job.timeout) {
       jobObj['timeout-minutes'] = this.parseTimeoutMinutes(job.timeout);
     }
 
-    // retry: no native equivalent in GitHub Actions
     if (job.retry !== undefined && job.retry > 0) {
       this._warnings.push(
         `@job ${job.id} retry=${job.retry}: GitHub Actions has no native job-level retry. Use "Re-run failed jobs" in the UI or the nick-fields/retry action for step-level retry.`
       );
     }
 
-    // coverage: no native equivalent in GitHub Actions
     if (job.coverage) {
       this._warnings.push(
         `@job ${job.id} coverage: GitHub Actions has no native coverage regex. Use a coverage action (e.g. codecov/codecov-action) instead.`
       );
     }
 
-    // extends: no native equivalent in GitHub Actions (GitLab CI only)
     if (job.extends) {
       this._warnings.push(
         `@job ${job.id} extends="${job.extends}": GitHub Actions has no native extends. Use reusable workflows or composite actions instead.`
       );
     }
 
-    // if: conditional (from @job rules)
     if (job.rules && job.rules.length > 0) {
-      // Combine all rule conditions with || (GitHub Actions only supports a single `if:`)
       const conditions = job.rules
         .filter(r => r.if)
         .map(r => this.translateCondition(r.if!));
@@ -294,7 +291,6 @@ export class GitHubActionsTarget extends BaseCICDTarget {
         jobObj.if = conditions.map(c => `(${c})`).join(' || ');
       }
 
-      // Warn about rule properties that don't translate to GitHub Actions
       const hasWhen = job.rules.some(r => r.when);
       const hasChanges = job.rules.some(r => r.changes && r.changes.length > 0);
       if (hasWhen) {
@@ -309,12 +305,10 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       }
     }
 
-    // env (from @job variables or @variables)
     if (job.variables && Object.keys(job.variables).length > 0) {
       jobObj.env = { ...job.variables };
     }
 
-    // environment
     if (job.environment) {
       const envConfig = ast.options?.cicd?.environments?.find((e) => e.name === job.environment);
       if (envConfig?.url) {
@@ -324,7 +318,6 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       }
     }
 
-    // matrix strategy
     if (job.matrix) {
       const strategy: Record<string, unknown> = {};
       if (job.matrix.dimensions) {
@@ -341,7 +334,6 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       jobObj.strategy = strategy;
     }
 
-    // services
     if (job.services && job.services.length > 0) {
       const services: Record<string, unknown> = {};
       for (const svc of job.services) {
@@ -353,10 +345,10 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       jobObj.services = services;
     }
 
-    // steps
+    // Build steps: checkout, setup, install, then run compiled workflow
     const steps: unknown[] = [];
 
-    // Download artifacts first
+    // Download artifacts from upstream jobs
     if (job.downloadArtifacts && job.downloadArtifacts.length > 0) {
       for (const artifactName of job.downloadArtifacts) {
         const artifact = ast.options?.cicd?.artifacts?.find((a) => a.name === artifactName);
@@ -370,10 +362,29 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       }
     }
 
-    // Cache step
+    // Native setup: checkout
+    steps.push({
+      name: NATIVE_CI_STEPS.checkout.label,
+      uses: NATIVE_CI_STEPS.checkout.githubAction,
+    });
+
+    // Native setup: setup-node
+    steps.push({
+      name: NATIVE_CI_STEPS['setup-node'].label,
+      uses: NATIVE_CI_STEPS['setup-node'].githubAction,
+      with: { ...NATIVE_CI_STEPS['setup-node'].githubWith },
+    });
+
+    // Cache
     if (job.cache) {
       steps.push(this.renderCacheStep(job.cache));
     }
+
+    // Install dependencies
+    steps.push({
+      name: 'Install dependencies',
+      run: 'npm ci',
+    });
 
     // before_script as a setup step
     if (job.beforeScript && job.beforeScript.length > 0) {
@@ -383,13 +394,37 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       });
     }
 
-    // Node steps
+    // Run compiled workflow for this job
+    const workflowBasename = ast.functionName;
+    const runStep: Record<string, unknown> = {
+      name: `Run ${job.name}`,
+      run: `node dist/${workflowBasename}.cicd.js --job=${job.id}`,
+    };
+
+    // Merge all step-level env vars (from secret wiring) into the run step
+    const mergedEnv: Record<string, string> = {};
     for (const step of job.steps) {
-      steps.push(this.renderStep(step));
+      if (step.env) {
+        Object.assign(mergedEnv, step.env);
+      }
+    }
+    if (Object.keys(mergedEnv).length > 0) {
+      runStep.env = mergedEnv;
     }
 
-    // Upload artifacts last
+    steps.push(runStep);
+
+    // Upload artifacts
     if (job.uploadArtifacts && job.uploadArtifacts.length > 0) {
+      // Upload .fw-outputs for cross-job data flow
+      steps.push({
+        uses: 'actions/upload-artifact@v4',
+        with: {
+          name: `fw-outputs-${job.id}`,
+          path: '.fw-outputs/',
+        },
+      });
+
       for (const artifact of job.uploadArtifacts) {
         const uploadStep: Record<string, unknown> = {
           uses: 'actions/upload-artifact@v4',
@@ -405,7 +440,7 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       }
     }
 
-    // reports: junit → test-reporter, coverage → codecov
+    // Reports
     if (job.reports && job.reports.length > 0) {
       for (const report of job.reports) {
         if (report.type === 'junit') {
@@ -439,72 +474,24 @@ export class GitHubActionsTarget extends BaseCICDTarget {
     }
 
     jobObj.steps = steps;
-
     return jobObj;
   }
 
-  /**
-   * Parse a timeout string like "30m", "1h", "1h30m" into minutes.
-   */
   private parseTimeoutMinutes(timeout: string): number {
     let minutes = 0;
     const hourMatch = timeout.match(/(\d+)h/);
     const minMatch = timeout.match(/(\d+)m/);
     if (hourMatch) minutes += parseInt(hourMatch[1], 10) * 60;
     if (minMatch) minutes += parseInt(minMatch[1], 10);
-    return minutes || 60; // default 60 if unparseable
+    return minutes || 60;
   }
 
-  /**
-   * Translate GitLab-style CI variable conditions to GitHub Actions expressions.
-   */
   private translateCondition(condition: string): string {
     return condition
       .replace(/\$CI_COMMIT_BRANCH/g, "github.ref_name")
       .replace(/\$CI_COMMIT_TAG/g, "startsWith(github.ref, 'refs/tags/')")
       .replace(/\$CI_PIPELINE_SOURCE/g, "github.event_name")
       .replace(/==/g, '==');
-  }
-
-  private renderStep(step: CICDStep): Record<string, unknown> {
-    const mapping = this.resolveActionMapping(step, 'github-actions');
-
-    if (mapping?.githubAction) {
-      // Use a pre-built action
-      const stepObj: Record<string, unknown> = {
-        name: mapping.label || step.name,
-        uses: mapping.githubAction,
-      };
-      if (mapping.githubWith) {
-        stepObj.with = { ...mapping.githubWith };
-      }
-      if (step.env && Object.keys(step.env).length > 0) {
-        stepObj.env = step.env;
-      }
-      return stepObj;
-    }
-
-    if (mapping?.gitlabScript) {
-      // Known node type but no GitHub action — use run:
-      const stepObj: Record<string, unknown> = {
-        name: mapping.label || step.name,
-        run: mapping.gitlabScript.join('\n'),
-      };
-      if (step.env && Object.keys(step.env).length > 0) {
-        stepObj.env = step.env;
-      }
-      return stepObj;
-    }
-
-    // Unknown node type — generate TODO placeholder
-    const stepObj: Record<string, unknown> = {
-      name: step.name,
-      run: `echo "TODO: Implement step '${step.id}' (node type: ${step.nodeType})"`,
-    };
-    if (step.env && Object.keys(step.env).length > 0) {
-      stepObj.env = step.env;
-    }
-    return stepObj;
   }
 
   private renderCacheStep(cache: { strategy: string; key?: string; path?: string }): Record<string, unknown> {
@@ -537,31 +524,24 @@ export class GitHubActionsTarget extends BaseCICDTarget {
     };
   }
 
-  /**
-   * Apply workflow-level options (cache, services, matrix) to jobs.
-   */
   private applyWorkflowOptions(jobs: CICDJob[], ast: TWorkflowAST): void {
     const cicd = ast.options?.cicd;
     if (!cicd) return;
 
-    // Apply cache to all jobs (or first job if only one)
     if (cicd.caches && cicd.caches.length > 0) {
       const targetJobs = jobs.length === 1 ? jobs : jobs.filter((j) => j.needs.length === 0);
       for (const job of targetJobs) {
-        job.cache = cicd.caches[0]; // Primary cache
+        job.cache = cicd.caches[0];
       }
     }
 
-    // Apply services to all jobs
     if (cicd.services && cicd.services.length > 0) {
       for (const job of jobs) {
         job.services = cicd.services;
       }
     }
 
-    // Apply matrix to first job (or specific jobs based on convention)
     if (cicd.matrix) {
-      // Apply to all jobs that don't have dependencies (root jobs)
       const rootJobs = jobs.filter((j) => j.needs.length === 0);
       for (const job of rootJobs) {
         job.matrix = cicd.matrix;

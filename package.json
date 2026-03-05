@@ -1,6 +1,6 @@
 {
   "name": "@synergenius/flowweaver-pack-github-actions",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "GitHub Actions CI/CD export target for Flow Weaver",
   "keywords": [
     "flowweaver-marketplace-pack",
@@ -17,7 +17,8 @@
     ]
   },
   "peerDependencies": {
-    "@synergenius/flow-weaver": ">=0.17.7"
+    "@synergenius/flow-weaver": ">=0.17.7",
+    "@synergenius/flowweaver-pack-cicd": ">=0.2.0"
   },
   "dependencies": {
     "yaml": "^2.8.0"
