@@ -215,12 +215,40 @@ export class GitHubActionsTarget extends BaseCICDTarget {
   private renderJob(job: CICDJob, ast: TWorkflowAST): Record<string, unknown> {
     const jobObj: Record<string, unknown> = {};
 
-    // runs-on
-    jobObj['runs-on'] = job.runner || 'ubuntu-latest';
+    // runs-on (tags override: self-hosted + tag labels)
+    if (job.tags && job.tags.length > 0) {
+      jobObj['runs-on'] = ['self-hosted', ...job.tags];
+    } else {
+      jobObj['runs-on'] = job.runner || 'ubuntu-latest';
+    }
 
     // needs
     if (job.needs.length > 0) {
       jobObj.needs = job.needs;
+    }
+
+    // continue-on-error (from @job allow_failure)
+    if (job.allowFailure) {
+      jobObj['continue-on-error'] = true;
+    }
+
+    // timeout-minutes (from @job timeout, parse "30m" → 30, "1h" → 60)
+    if (job.timeout) {
+      jobObj['timeout-minutes'] = this.parseTimeoutMinutes(job.timeout);
+    }
+
+    // if: conditional (from @job rules)
+    if (job.rules && job.rules.length > 0) {
+      // Use the first rule's `if` condition, translate GitLab-style vars to GitHub context
+      const condition = job.rules[0].if;
+      if (condition) {
+        jobObj.if = this.translateCondition(condition);
+      }
+    }
+
+    // env (from @job variables or @variables)
+    if (job.variables && Object.keys(job.variables).length > 0) {
+      jobObj.env = { ...job.variables };
     }
 
     // environment
@@ -284,6 +312,14 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       steps.push(this.renderCacheStep(job.cache));
     }
 
+    // before_script as a setup step
+    if (job.beforeScript && job.beforeScript.length > 0) {
+      steps.push({
+        name: 'Setup',
+        run: job.beforeScript.join('\n'),
+      });
+    }
+
     // Node steps
     for (const step of job.steps) {
       steps.push(this.renderStep(step));
@@ -306,9 +342,65 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       }
     }
 
+    // reports: junit → test-reporter, coverage → codecov
+    if (job.reports && job.reports.length > 0) {
+      for (const report of job.reports) {
+        if (report.type === 'junit') {
+          steps.push({
+            name: 'Test Report',
+            uses: 'dorny/test-reporter@v1',
+            if: 'always()',
+            with: {
+              name: 'Test Results',
+              path: report.path,
+              reporter: 'java-junit',
+            },
+          });
+        } else if (report.type === 'cobertura' || report.type === 'coverage') {
+          steps.push({
+            name: 'Upload Coverage',
+            uses: 'codecov/codecov-action@v4',
+            with: { files: report.path },
+          });
+        } else {
+          steps.push({
+            name: `Upload ${report.type} report`,
+            uses: 'actions/upload-artifact@v4',
+            with: {
+              name: `${report.type}-report`,
+              path: report.path,
+            },
+          });
+        }
+      }
+    }
+
     jobObj.steps = steps;
 
     return jobObj;
+  }
+
+  /**
+   * Parse a timeout string like "30m", "1h", "1h30m" into minutes.
+   */
+  private parseTimeoutMinutes(timeout: string): number {
+    let minutes = 0;
+    const hourMatch = timeout.match(/(\d+)h/);
+    const minMatch = timeout.match(/(\d+)m/);
+    if (hourMatch) minutes += parseInt(hourMatch[1], 10) * 60;
+    if (minMatch) minutes += parseInt(minMatch[1], 10);
+    return minutes || 60; // default 60 if unparseable
+  }
+
+  /**
+   * Translate GitLab-style CI variable conditions to GitHub Actions expressions.
+   */
+  private translateCondition(condition: string): string {
+    return condition
+      .replace(/\$CI_COMMIT_BRANCH/g, "github.ref_name")
+      .replace(/\$CI_COMMIT_TAG/g, "startsWith(github.ref, 'refs/tags/')")
+      .replace(/\$CI_PIPELINE_SOURCE/g, "github.event_name")
+      .replace(/==/g, '==');
   }
 
   private renderStep(step: CICDStep): Record<string, unknown> {
