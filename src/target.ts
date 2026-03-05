@@ -34,6 +34,9 @@ export class GitHubActionsTarget extends BaseCICDTarget {
   readonly name = 'github-actions';
   readonly description = 'GitHub Actions workflow YAML (.github/workflows/)';
 
+  /** Accumulated warnings for the current export run */
+  private _warnings: string[] = [];
+
   readonly deploySchema = {
     runner: { type: 'string' as const, description: 'GitHub runner label', default: 'ubuntu-latest' },
   };
@@ -45,6 +48,7 @@ export class GitHubActionsTarget extends BaseCICDTarget {
   };
 
   async generate(options: ExportOptions): Promise<ExportArtifacts> {
+    this._warnings = [];
     const filePath = path.resolve(options.sourceFile);
     const outputDir = path.resolve(options.outputDir);
 
@@ -99,6 +103,7 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       target: this.name,
       workflowName: options.displayName || targetWorkflows[0].name,
       entryPoint: files[0].relativePath,
+      warnings: this._warnings.length > 0 ? this._warnings : undefined,
     };
   }
 
@@ -137,6 +142,25 @@ export class GitHubActionsTarget extends BaseCICDTarget {
 
     // on: triggers
     doc.on = this.renderTriggers(ast.options?.cicd?.triggers || []);
+
+    // env (workflow-level, from @variables)
+    if (ast.options?.cicd?.variables && Object.keys(ast.options.cicd.variables).length > 0) {
+      doc.env = { ...ast.options.cicd.variables };
+    }
+
+    // Warn about @includes (GitLab CI only)
+    if (ast.options?.cicd?.includes && ast.options.cicd.includes.length > 0) {
+      this._warnings.push(
+        `@includes: GitHub Actions has no equivalent to GitLab CI includes. Use reusable workflows (workflow_call) or composite actions instead.`
+      );
+    }
+
+    // Warn about @before_script at workflow level (no GH Actions equivalent)
+    if (ast.options?.cicd?.beforeScript && ast.options.cicd.beforeScript.length > 0) {
+      this._warnings.push(
+        `Workflow-level @before_script: GitHub Actions has no global before_script. It has been applied per-job instead.`
+      );
+    }
 
     // concurrency
     if (ast.options?.cicd?.concurrency) {
@@ -237,12 +261,51 @@ export class GitHubActionsTarget extends BaseCICDTarget {
       jobObj['timeout-minutes'] = this.parseTimeoutMinutes(job.timeout);
     }
 
+    // retry: no native equivalent in GitHub Actions
+    if (job.retry !== undefined && job.retry > 0) {
+      this._warnings.push(
+        `@job ${job.id} retry=${job.retry}: GitHub Actions has no native job-level retry. Use "Re-run failed jobs" in the UI or the nick-fields/retry action for step-level retry.`
+      );
+    }
+
+    // coverage: no native equivalent in GitHub Actions
+    if (job.coverage) {
+      this._warnings.push(
+        `@job ${job.id} coverage: GitHub Actions has no native coverage regex. Use a coverage action (e.g. codecov/codecov-action) instead.`
+      );
+    }
+
+    // extends: no native equivalent in GitHub Actions (GitLab CI only)
+    if (job.extends) {
+      this._warnings.push(
+        `@job ${job.id} extends="${job.extends}": GitHub Actions has no native extends. Use reusable workflows or composite actions instead.`
+      );
+    }
+
     // if: conditional (from @job rules)
     if (job.rules && job.rules.length > 0) {
-      // Use the first rule's `if` condition, translate GitLab-style vars to GitHub context
-      const condition = job.rules[0].if;
-      if (condition) {
-        jobObj.if = this.translateCondition(condition);
+      // Combine all rule conditions with || (GitHub Actions only supports a single `if:`)
+      const conditions = job.rules
+        .filter(r => r.if)
+        .map(r => this.translateCondition(r.if!));
+      if (conditions.length === 1) {
+        jobObj.if = conditions[0];
+      } else if (conditions.length > 1) {
+        jobObj.if = conditions.map(c => `(${c})`).join(' || ');
+      }
+
+      // Warn about rule properties that don't translate to GitHub Actions
+      const hasWhen = job.rules.some(r => r.when);
+      const hasChanges = job.rules.some(r => r.changes && r.changes.length > 0);
+      if (hasWhen) {
+        this._warnings.push(
+          `@job ${job.id} rules when=: GitHub Actions has no native when (manual/delayed/always). Use workflow_dispatch for manual triggers.`
+        );
+      }
+      if (hasChanges) {
+        this._warnings.push(
+          `@job ${job.id} rules changes=: GitHub Actions handles path filtering via on.push.paths, not per-job. Use dorny/paths-filter for per-job path filtering.`
+        );
       }
     }
 
