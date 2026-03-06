@@ -1,6 +1,6 @@
 {
   "name": "@synergenius/flowweaver-pack-github-actions",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "GitHub Actions CI/CD export target for Flow Weaver",
   "keywords": [
     "flowweaver-marketplace-pack",
