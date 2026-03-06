@@ -187,11 +187,7 @@ try {
   fs.unlinkSync(notesFile);
 }
 success(`Release ${tag} published on GitHub`);
-
-// 6. Publish to npm
-info('Publishing to npm...');
-run('npm publish --access public', { stdio: 'inherit' });
-success(`Published ${pkg.name}@${newVersion} to npm`);
+info('npm publish will be handled by CI (npm-publish workflow)');
 
 // Cleanup
 try {
