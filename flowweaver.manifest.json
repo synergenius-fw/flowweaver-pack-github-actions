@@ -1,7 +1,7 @@
 {
   "manifestVersion": 2,
   "name": "@synergenius/flowweaver-pack-github-actions",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "nodeTypes": [],
   "workflows": [],
   "patterns": [],
