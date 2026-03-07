@@ -10,14 +10,14 @@
   ],
   "flowWeaver": {
     "type": "marketplace-pack",
-    "engineVersion": ">=0.17.7",
+    "engineVersion": ">=0.17.0",
     "categories": [
       "deployment",
       "cicd"
     ]
   },
   "peerDependencies": {
-    "@synergenius/flow-weaver": ">=0.17.7",
+    "@synergenius/flow-weaver": ">=0.17.0",
     "@synergenius/flowweaver-pack-cicd": ">=0.2.0"
   },
   "dependencies": {
@@ -38,7 +38,8 @@
     "release": "tsx scripts/release.ts"
   },
   "devDependencies": {
-    "@synergenius/flow-weaver": "^0.17.7",
+    "@synergenius/flow-weaver": "^0.17.0",
+    "@synergenius/flowweaver-pack-cicd": "file:../flowweaver-pack-cicd",
     "@types/node": "^20.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.0.0",

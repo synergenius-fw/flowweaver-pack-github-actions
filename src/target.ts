@@ -15,6 +15,7 @@ import {
   resolveJobSecrets,
   injectArtifactSteps,
   generateSecretsDoc,
+  generateCICDRuntime,
   NATIVE_CI_STEPS,
   type CICDJob,
 } from '@synergenius/flowweaver-pack-cicd';
@@ -80,6 +81,11 @@ export class GitHubActionsTarget extends BaseExportTarget {
       injectArtifactSteps(jobs, artifacts);
       this.applyWorkflowOptions(jobs, ast);
 
+      // Generate the runtime TypeScript file that jobs will execute
+      const runtimeCode = generateCICDRuntime(ast, jobs, ast.nodeTypes);
+      const runtimeFileName = `src/${ast.functionName}.cicd.ts`;
+      files.push(this.createFile(outputDir, runtimeFileName, runtimeCode, 'handler'));
+
       const yamlContent = this.renderWorkflowYAML(ast, jobs);
       const yamlFileName = `.github/workflows/${ast.functionName}.yml`;
       files.push(this.createFile(outputDir, yamlFileName, yamlContent, 'config'));
@@ -130,8 +136,7 @@ export class GitHubActionsTarget extends BaseExportTarget {
         'Repository secrets configured (see SECRETS_SETUP.md)',
       ],
       steps: [
-        'Copy the .github/workflows/ directory to your repository root',
-        'Build your workflow: npx flow-weaver compile --target cicd <workflow>.ts',
+        'Copy the .github/workflows/ directory and the generated .cicd.ts runtime to your repository',
         'Configure required secrets in GitHub (Settings > Secrets > Actions)',
         'Push to trigger the workflow',
       ],
@@ -393,6 +398,20 @@ export class GitHubActionsTarget extends BaseExportTarget {
     const steps: unknown[] = [];
 
     // Download artifacts from upstream jobs
+    if (!job.skipDependencies && job.needs.length > 0) {
+      // Download .fw-artifacts/ from each upstream job for cross-job data transfer
+      for (const depJobId of job.needs) {
+        if (job.needsArtifactControl?.[depJobId] === false) continue;
+        steps.push({
+          uses: 'actions/download-artifact@v4',
+          with: {
+            name: `fw-artifacts-${depJobId}`,
+            path: '.fw-artifacts/',
+          },
+          'continue-on-error': true,
+        });
+      }
+    }
     if (!job.skipDependencies && job.downloadArtifacts && job.downloadArtifacts.length > 0) {
       for (const artifactName of job.downloadArtifacts) {
         // Skip download if needsArtifactControl explicitly disables it
@@ -453,11 +472,11 @@ export class GitHubActionsTarget extends BaseExportTarget {
       });
     }
 
-    // Run compiled workflow for this job
+    // Run compiled workflow for this job (tsx executes TypeScript directly)
     const workflowBasename = ast.functionName;
     const runStep: Record<string, unknown> = {
       name: `Run ${job.name}`,
-      run: `node dist/${workflowBasename}.cicd.js --job=${job.id}`,
+      run: `npx tsx src/${workflowBasename}.cicd.ts --job=${job.id}`,
     };
 
     // Merge all step-level env vars (from secret wiring) into the run step
@@ -475,12 +494,12 @@ export class GitHubActionsTarget extends BaseExportTarget {
 
     // Upload artifacts
     if (job.uploadArtifacts && job.uploadArtifacts.length > 0) {
-      // Upload .fw-outputs for cross-job data flow
+      // Upload .fw-artifacts for cross-job data transfer (runtime generator writes here)
       steps.push({
         uses: 'actions/upload-artifact@v4',
         with: {
-          name: `fw-outputs-${job.id}`,
-          path: '.fw-outputs/',
+          name: `fw-artifacts-${job.id}`,
+          path: '.fw-artifacts/',
         },
       });
 
