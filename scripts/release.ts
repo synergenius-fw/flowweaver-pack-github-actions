@@ -165,15 +165,17 @@ const prUrl = run(
 );
 info(`PR created: ${prUrl}`);
 
-info('Merging PR...');
-try {
-  run(`gh pr merge ${releaseBranch} --squash --subject "Release ${tag}" --body "Bump version to ${newVersion}" --admin`);
-} catch {
-  info('Admin merge failed, setting auto-merge...');
-  run(`gh pr merge ${releaseBranch} --squash --subject "Release ${tag}" --body "Bump version to ${newVersion}" --auto`);
-  console.log('\nAuto-merge enabled. The release will complete once CI passes.');
-  console.log(`After merge, run: gh release create ${tag} --target main --title "${tag}" --generate-notes`);
-  process.exit(0);
+// Enable auto-merge (waits for CI to pass before merging)
+info('Enabling auto-merge (waiting for CI)...');
+run(`gh pr merge ${releaseBranch} --squash --subject "Release ${tag}" --body "Bump version to ${newVersion}" --auto`);
+
+// Poll until the PR is merged
+info('Waiting for CI to pass and PR to merge...');
+for (let i = 0; i < 60; i++) {
+  const state = run(`gh pr view ${releaseBranch} --json state --jq .state`);
+  if (state === 'MERGED') break;
+  if (i === 59) fail('Timed out waiting for PR to merge (5 minutes). Check CI status.');
+  execSync('sleep 5');
 }
 
 success('PR merged');
