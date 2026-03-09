@@ -3,7 +3,7 @@
   "version": "0.2.5",
   "description": "GitHub Actions CI/CD export target for Flow Weaver",
   "keywords": [
-    "flowweaver-marketplace-pack",
+    "flow-weaver-marketplace-pack",
     "flow-weaver",
     "github-actions",
     "cicd"
